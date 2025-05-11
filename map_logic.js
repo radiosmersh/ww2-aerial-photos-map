@@ -1,5 +1,7 @@
 // --- Constants ---
 const GEOJSON_FILE_PATH = 'scans.geojson';
+const PARSE_WORKER_PATH = 'parse_worker.js';
+const FILTER_WORKER_PATH = 'filter_worker.js';
 const DATE_PROPERTY_NAME = 'date';
 const ORIGIN_PROPERTY_NAME = 'origin';
 const DEBOUNCE_DELAY = 300;
@@ -8,7 +10,7 @@ const SLIDER_MAX_DATE_STR = '1945-12-31';
 const LARGE_DATASET_THRESHOLD = 1000;
 const DEFAULT_EMPTY_MAP_VIEW = [20, 0];
 const DEFAULT_EMPTY_MAP_ZOOM = 2;
-const LOADER_HIDE_DELAY = 100; // Standard delay for hiding loader after final text
+const LOADER_HIDE_DELAY = 100;
 
 // --- DOM Element References (initialized in DOMContentLoaded) ---
 let domElements = {};
@@ -18,12 +20,15 @@ let map;
 let markerClusterGroup;
 let fullGeoJsonData;
 
+// --- Worker Variables ---
+let activeFilterWorker = null;
+
 // --- Date Filter Variables ---
 let currentStartDateEpoch, currentEndDateEpoch;
 let debounceTimer;
 let sliderMinEpoch, sliderMaxEpoch;
 
-// --- Loader Text Generators (for chunk progress) ---
+// --- Loader Text Generators (for Leaflet.MarkerCluster chunk progress) ---
 let chunkProgressTextGenerator = (p, t) => `Processing features: ${Math.round((p/t)*100)}% (${p}/${t})`;
 let chunkFinalizeTextGenerator = () => `Finalizing features...`;
 
@@ -37,7 +42,10 @@ function showLoader(showSpinner = true, showProgressBar = false, text = "Loading
     updateLoaderText(text);
     domElements.loaderContainer.classList.remove('hidden');
     if (domElements.spinner) domElements.spinner.classList.toggle('hidden', !showSpinner);
+    // Ensure progress bar elements are hidden if showProgressBar is false
     if (domElements.progressInfo) domElements.progressInfo.classList.toggle('hidden', !showProgressBar);
+    if (domElements.progressBarContainer) domElements.progressBarContainer.classList.toggle('hidden', !showProgressBar);
+
 }
 
 function hideLoader(delay = LOADER_HIDE_DELAY) {
@@ -49,17 +57,21 @@ function hideLoader(delay = LOADER_HIDE_DELAY) {
     }, delay);
 }
 
+// updateProgressBar is no longer used for download, but Leaflet MarkerCluster might have its own progress concept
+// For now, this function is not directly called by the simplified download.
+// If you re-introduce a progress bar for other operations, it's here.
+/*
 function updateProgressBar(percentage) {
     if (domElements.progressBar) domElements.progressBar.style.width = `${percentage}%`;
 }
+*/
 
-// --- Date Helper Functions ---
+// --- Date Helper Functions (used on main thread) ---
 function getEpochFromDateString(dateStr, atTime = 'start') {
     if (!dateStr) return NaN;
     let fullDateStr = dateStr;
     if (atTime === 'start') fullDateStr += 'T00:00:00.000Z';
     else if (atTime === 'end') fullDateStr += 'T23:59:59.999Z';
-    else if (dateStr.length === 10) fullDateStr += 'T00:00:00Z'; // 'exact' for date-only strings defaults to start of day
     return new Date(fullDateStr).getTime();
 }
 
@@ -95,8 +107,8 @@ function createPopupContent(properties) {
 }
 
 // --- Map Layer Handling ---
-function createGeoJsonLayer(geojsonData) {
-    return L.geoJSON(geojsonData, {
+function createGeoJsonLayer(geoJsonFeatureCollection) {
+    return L.geoJSON(geoJsonFeatureCollection, {
         onEachFeature: function (feature, layer) {
             if (feature.properties) {
                 layer.bindPopup(createPopupContent(feature.properties), { maxWidth: 300 });
@@ -107,20 +119,17 @@ function createGeoJsonLayer(geojsonData) {
 
 function createSharedMarkerClusterGroup() {
     function sharedChunkProgressCallback(processed, total) {
-        // This callback is used by L.markercluster when chunkedLoading is true
-        // and it processes data in chunks.
         if (processed < total) {
             updateLoaderText(chunkProgressTextGenerator(processed, total));
         } else {
-            // All chunks processed
             updateLoaderText(chunkFinalizeTextGenerator());
-            hideLoader(); // Uses default LOADER_HIDE_DELAY
+            hideLoader();
         }
     }
     return L.markerClusterGroup({
-        chunkedLoading: true, // Enable Leaflet.markercluster's chunked loading
-        maxClusterRadius: 70,   // Example: Adjust as needed
-        chunkProgress: sharedChunkProgressCallback // Provide the callback
+        chunkedLoading: true,
+        maxClusterRadius: 70,
+        chunkProgress: sharedChunkProgressCallback
     });
 }
 
@@ -173,108 +182,111 @@ function handleDateSliderChange(event) {
     domElements.endDateValueDisplay.textContent = formatDateEpochToInput(currentEndDateEpoch);
 
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(filterAndRedrawMap, DEBOUNCE_DELAY);
+    debounceTimer = setTimeout(filterAndRedrawMapWithWorker, DEBOUNCE_DELAY);
 }
 
-function filterAndRedrawMap() {
-    if (!fullGeoJsonData || !map) {
+function filterAndRedrawMapWithWorker() {
+    if (!fullGeoJsonData || !fullGeoJsonData.features || !map) {
         console.warn("Data or map not ready for filtering.");
         return;
     }
 
     showLoader(true, false, `Filtering for ${formatDateEpochToInput(currentStartDateEpoch)} to ${formatDateEpochToInput(currentEndDateEpoch)}...`);
 
-    // Short timeout to allow loader to display before potentially blocking filter logic
-    setTimeout(() => {
-        const startFilterEpoch = getEpochFromDateString(formatDateEpochToInput(currentStartDateEpoch), 'start');
-        const endFilterEpoch = getEpochFromDateString(formatDateEpochToInput(currentEndDateEpoch), 'end');
+    if (activeFilterWorker) {
+        activeFilterWorker.terminate();
+        console.log("Previous filter worker terminated.");
+    }
 
-        const filteredFeatures = fullGeoJsonData.features.filter(feature => {
-            if (feature.properties && feature.properties[DATE_PROPERTY_NAME]) {
-                const featureEpoch = getEpochFromDateString(feature.properties[DATE_PROPERTY_NAME], 'exact');
-                return !isNaN(featureEpoch) && featureEpoch >= startFilterEpoch && featureEpoch <= endFilterEpoch;
-            }
-            return false;
-        });
-        const filteredGeoJson = { type: "FeatureCollection", features: filteredFeatures };
-        updateMapWithFilteredData(filteredGeoJson);
-    }, 20); // Small delay for UI update to show loader text
+    activeFilterWorker = new Worker(FILTER_WORKER_PATH);
+
+    const startFilterEpoch = getEpochFromDateString(formatDateEpochToInput(currentStartDateEpoch), 'start');
+    const endFilterEpoch = getEpochFromDateString(formatDateEpochToInput(currentEndDateEpoch), 'end');
+
+    activeFilterWorker.onmessage = (e) => {
+        if (e.data.type === 'success') {
+            const filteredGeoJson = { type: "FeatureCollection", features: e.data.data };
+            updateMapWithFilteredData(filteredGeoJson);
+        } else {
+            console.error("Filter worker error:", e.data.message);
+            updateLoaderText(`Error during filtering: ${e.data.message}`);
+            hideLoader(0);
+        }
+        activeFilterWorker.terminate();
+        activeFilterWorker = null;
+    };
+
+    activeFilterWorker.onerror = (err) => {
+        console.error("Filter worker script error:", err.message, err);
+        updateLoaderText(`Critical filter worker error: ${err.message}`);
+        hideLoader(0);
+        if (activeFilterWorker) activeFilterWorker.terminate(); // Ensure termination
+        activeFilterWorker = null;
+    };
+
+    activeFilterWorker.postMessage({
+        features: fullGeoJsonData.features,
+        datePropertyName: DATE_PROPERTY_NAME,
+        startFilterEpoch: startFilterEpoch,
+        endFilterEpoch: endFilterEpoch
+    });
 }
 
 function updateMapWithFilteredData(filteredGeoJson) {
     if (!markerClusterGroup) {
         console.error("markerClusterGroup not initialized for update.");
-        hideLoader(0); // Hide immediately
+        hideLoader(0);
         return;
     }
-    markerClusterGroup.clearLayers(); // Clear previous layers
+    markerClusterGroup.clearLayers();
     const featureCount = filteredGeoJson.features.length;
 
     if (featureCount > 0) {
-        const processAsLargeDataset = featureCount > LARGE_DATASET_THRESHOLD;
-
-        // Update text generators for the chunkProgress callback
         chunkProgressTextGenerator = (p, t) => `Updating map: ${Math.round((p/t)*100)}% (${p}/${t} features)`;
         chunkFinalizeTextGenerator = () => `Finalizing filtered map...`;
 
-        if (processAsLargeDataset) {
-            // Loader is already shown by filterAndRedrawMap.
-            // Text will be updated by chunkProgressCallback if chunking occurs.
-            // Set an initial text before chunking might start.
+        if (featureCount > LARGE_DATASET_THRESHOLD) {
             updateLoaderText('Applying filter, adding features to map...');
         } else {
-            // For small datasets, chunkProgress might not fire or fires very quickly.
             updateLoaderText(`Processing ${featureCount} filtered features...`);
         }
 
         const geoJsonLayer = createGeoJsonLayer(filteredGeoJson);
-        markerClusterGroup.addLayer(geoJsonLayer); // This will trigger chunkProgress if applicable
+        markerClusterGroup.addLayer(geoJsonLayer);
 
-        if (!processAsLargeDataset) {
-            // For small datasets, chunking might not happen, or happens in one go.
-            // Manually update text and hide loader.
+        if (featureCount <= LARGE_DATASET_THRESHOLD) {
             updateLoaderText(`Displaying ${featureCount} filtered features.`);
             hideLoader();
         }
-        // If processAsLargeDataset, sharedChunkProgressCallback will handle final text and hideLoader.
     } else {
         updateLoaderText('No features match filter. Displaying 0 features.');
         hideLoader();
     }
 }
 
-
-// --- Initial Display ---
 function displayInitialData(geojsonData) {
     fullGeoJsonData = geojsonData;
-    const totalFeatures = geojsonData.features.length;
+    const totalFeatures = geojsonData.features ? geojsonData.features.length : 0;
 
-    // Initialize markerClusterGroup if it doesn't exist (first load)
     if (!markerClusterGroup) {
         markerClusterGroup = createSharedMarkerClusterGroup();
-        map.addLayer(markerClusterGroup); // Add to map once
+        map.addLayer(markerClusterGroup);
     } else {
-        markerClusterGroup.clearLayers(); // Should not happen on truly initial call, but good for robust re-loads
+        markerClusterGroup.clearLayers();
     }
 
     if (totalFeatures > 0) {
-        const processAsLargeDataset = totalFeatures > LARGE_DATASET_THRESHOLD;
-
-        // Update text generators for the chunkProgress callback for initial load
         chunkProgressTextGenerator = (p, t) => `Adding initial features: ${Math.round((p/t)*100)}% (${p}/${t})`;
         chunkFinalizeTextGenerator = () => `Finalizing initial features...`;
 
-        if (processAsLargeDataset) {
-            // Loader is likely visible from loadAndDisplayData.
-            // Ensure spinner is active and text is updated for large dataset processing.
+        if (totalFeatures > LARGE_DATASET_THRESHOLD) {
             showLoader(true, false, 'Adding initial features (large dataset processing)...');
         } else {
-            // For small datasets, update text. Loader is already visible.
             updateLoaderText('Processing initial features...');
         }
 
         const geoJsonLayer = createGeoJsonLayer(geojsonData);
-        markerClusterGroup.addLayer(geoJsonLayer); // Triggers chunkProgress if applicable
+        markerClusterGroup.addLayer(geoJsonLayer);
 
         const bounds = geoJsonLayer.getBounds();
         if (bounds.isValid()) {
@@ -284,126 +296,97 @@ function displayInitialData(geojsonData) {
             map.setView(DEFAULT_EMPTY_MAP_VIEW, DEFAULT_EMPTY_MAP_ZOOM);
         }
 
-        if (!processAsLargeDataset) {
-            // For small datasets, manually update text and hide loader
+        if (totalFeatures <= LARGE_DATASET_THRESHOLD) {
             updateLoaderText(`Displaying ${totalFeatures} features. Map ready.`);
             hideLoader();
         }
-        // If processAsLargeDataset, sharedChunkProgressCallback handles final text and hideLoader
     } else {
         updateLoaderText('No initial features to display.');
         map.setView(DEFAULT_EMPTY_MAP_VIEW, DEFAULT_EMPTY_MAP_ZOOM);
         hideLoader();
     }
-    initializeDateSliders(); // Initialize sliders after data is processed
+    initializeDateSliders();
 }
 
-// --- Main Data Loading ---
 async function loadAndDisplayData() {
+    // Start with initializing app message, spinner only
     showLoader(true, false, 'Initializing application...');
-    let dataProcessingAttempted = false;
 
     try {
-        // Brief pause for "Initializing application..." to render
-        await new Promise(resolve => setTimeout(resolve, 20));
-        updateLoaderText('Fetching geographic data...');
+        // Update to "Fetching..." message, spinner only
+        showLoader(true, false, 'Downloading geospatial data...');
         const response = await fetch(GEOJSON_FILE_PATH);
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status} fetching ${GEOJSON_FILE_PATH}`);
 
-        const contentLength = response.headers.get('Content-Length');
-        let geojsonData;
+        // Get the response as text directly
+        const geoJsonString = await response.text();
 
-        if (contentLength && parseInt(contentLength, 10) > 0) {
-            const totalLength = parseInt(contentLength, 10); // Potentially compressed length
-            let receivedLength = 0; // Will be uncompressed length
-            const reader = response.body.getReader();
-            const chunks = [];
-            showLoader(false, true, 'Downloading data: 0%'); // Show progress bar
-            updateProgressBar(0);
+        // --- Parsing with Worker ---
+        showLoader(true, false, 'Parsing downloaded data in background...');
+        const parserWorker = new Worker(PARSE_WORKER_PATH);
 
-            while (true) {
-                const { done, value } = await reader.read(); // value is an uncompressed chunk
-                if (done) break;
-                chunks.push(value);
-                receivedLength += value.length;
+        parserWorker.onmessage = (e) => {
+            if (e.data.type === 'success') {
+                let geojsonData = e.data.data;
+                if (!geojsonData || !geojsonData.features) {
+                    console.warn("Parsed GeoJSON is invalid or has no features. Using empty dataset.");
+                    geojsonData = { type: "FeatureCollection", features: [] };
+                }
 
-                // Cap displayed percentage at 100% if totalLength was compressed size
-                const rawPercentage = totalLength > 0 ? (receivedLength / totalLength) * 100 : 0;
-                const displayPercentage = Math.min(100, Math.round(rawPercentage));
-
-                updateProgressBar(displayPercentage);
-                updateLoaderText(`Downloading data: ${displayPercentage}%`);
+                if (!map) {
+                    updateLoaderText('Initializing map framework...');
+                    map = L.map(domElements.mapElement);
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                        maxZoom: 19
+                    }).addTo(map);
+                }
+                displayInitialData(geojsonData);
+            } else {
+                console.error("Parser worker error:", e.data.message);
+                throw new Error(`Parsing failed: ${e.data.message}`);
             }
-            const chunksAll = new Uint8Array(receivedLength);
-            let position = 0;
-            for (const chunk of chunks) { chunksAll.set(chunk, position); position += chunk.length; }
+            parserWorker.terminate();
+        };
 
-            showLoader(true, false, 'Parsing downloaded data...'); // Switch back to spinner
-            await new Promise(resolve => setTimeout(resolve, 20)); // UI update pause
+        parserWorker.onerror = (err) => {
+            console.error("Parser worker script error:", err.message, err);
+            if (parserWorker) parserWorker.terminate();
+            throw new Error(`Critical parser worker error: ${err.message}`);
+        };
 
-            const resultText = new TextDecoder("utf-8").decode(chunksAll);
-            geojsonData = JSON.parse(resultText);
-        } else {
-            showLoader(true, false, 'Downloading data (size unknown)...');
-            await new Promise(resolve => setTimeout(resolve, 20)); // UI update pause
-            geojsonData = await response.json();
-            showLoader(true, false, 'Parsing downloaded data...');
-            await new Promise(resolve => setTimeout(resolve, 20)); // UI update pause
-        }
-
-        dataProcessingAttempted = true;
-        if (!geojsonData || !geojsonData.features) {
-            console.warn("GeoJSON file loaded but has no features array or is invalid. Using empty dataset.");
-            geojsonData = { type: "FeatureCollection", features: [] };
-        }
+        parserWorker.postMessage({ geoJsonString });
 
         if (!map) {
-            updateLoaderText('Initializing map framework...');
-            await new Promise(resolve => setTimeout(resolve, 20)); // UI update pause
-            map = L.map(domElements.mapElement);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-                maxZoom: 19
-            }).addTo(map);
-            console.log("Map framework initialized.");
+            updateLoaderText('Initializing map framework and parsing data...');
+             map = L.map(domElements.mapElement);
+             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                 attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                 maxZoom: 19
+             }).addTo(map);
         }
-        displayInitialData(geojsonData);
 
     } catch (error) {
         console.error("Failed to load or display GeoJSON:", error);
-        updateLoaderText(`Error: ${error.message}. Check console for details.`);
-        dataProcessingAttempted = true;
-        if (!map && domElements.mapElement) { // Initialize a basic map if one doesn't exist
+        updateLoaderText(`Error: ${error.message}. Check console.`);
+        if (!map && domElements.mapElement) {
              map = L.map(domElements.mapElement).setView(DEFAULT_EMPTY_MAP_VIEW, DEFAULT_EMPTY_MAP_ZOOM);
              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM contributors'}).addTo(map);
-             console.warn("Map initialized to default view due to data loading error.");
         }
-        hideLoader(0); // Hide loader immediately after showing error message
-    } finally {
-        // Failsafe: if loader is still visible after processing and not showing a final/error message
-        if (dataProcessingAttempted && domElements.loaderContainer && !domElements.loaderContainer.classList.contains('hidden')) {
-            const currentText = domElements.loaderText ? domElements.loaderText.textContent.toLowerCase() : "";
-            const isFinalMessageContext = currentText.includes("finalizing") ||
-                                   currentText.includes("map ready") ||
-                                   currentText.includes("displaying") ||
-                                   currentText.startsWith("error") ||
-                                   currentText.includes("no features"); // Add other relevant "final state" texts
-            if (!isFinalMessageContext) {
-                console.warn("Loader still visible in finally without an expected final message. Hiding as failsafe. Text was:", domElements.loaderText.textContent);
-                hideLoader(200); // Slightly longer delay for failsafe hide
-            }
-        }
-        if (domElements.progressBar) updateProgressBar(0); // Reset progress bar visuals
+        hideLoader(0);
     }
+    // The 'finally' block is removed as its role for loader management is diminished
+    // with the current flow where errors or completion in workers/displayInitialData handle hiding.
+    // If progress bar was used for other things, might need to reset it here.
 }
 
-// --- Event Listener for DOM Ready ---
 document.addEventListener('DOMContentLoaded', () => {
     domElements = {
         loaderContainer: document.getElementById('loader-container'),
         spinner: document.querySelector('#loader-container .spinner'),
-        progressInfo: document.getElementById('progress-info'),
-        progressBar: document.getElementById('progress-bar'),
+        progressInfo: document.getElementById('progress-info'), // Still needed to hide it
+        progressBarContainer: document.getElementById('progress-bar-container'), // Still needed to hide it
+        // progressBar: document.getElementById('progress-bar'), // Not directly manipulated now
         loaderText: document.getElementById('loader-text'),
         dateFilterControls: document.getElementById('date-filter-controls'),
         startDateSlider: document.getElementById('startDateSlider'),
@@ -413,17 +396,20 @@ document.addEventListener('DOMContentLoaded', () => {
         mapElement: document.getElementById('map')
     };
 
-    // Check if all critical DOM elements are found
-    const missingElements = Object.entries(domElements).filter(([key, el]) => !el);
+    // Ensure progress bar related elements are hidden initially by showLoader if not used
+    if (domElements.progressInfo) domElements.progressInfo.classList.add('hidden');
+    if (domElements.progressBarContainer) domElements.progressBarContainer.classList.add('hidden');
+
+
+    const missingElements = Object.entries(domElements).filter(([, el]) => !el && el !== domElements.progressBar ); // progressBar is optional now
     if (missingElements.length > 0) {
         const missingElementIds = missingElements.map(([key]) => key).join(', ');
-        console.error(`Critical HTML element(s) missing: ${missingElementIds}. Check IDs in index.html.`);
-        if(domElements.loaderContainer) { // Attempt to show error in loader
-            updateLoaderText(`Error: UI elements missing (${missingElementIds}). App cannot start.`);
+        console.error(`Critical HTML element(s) missing: ${missingElementIds}.`);
+        if(domElements.loaderContainer) {
+            updateLoaderText(`Error: UI elements missing (${missingElementIds}).`);
             if(domElements.spinner) domElements.spinner.classList.add('hidden');
-            if(domElements.progressInfo) domElements.progressInfo.classList.add('hidden');
-        } else { // Fallback if even loader is missing
-            alert(`Error: Critical UI elements (${missingElementIds}) are missing. The application cannot start correctly.`);
+        } else {
+            alert(`Error: Critical UI elements missing (${missingElementIds}). App cannot start.`);
         }
         return;
     }
