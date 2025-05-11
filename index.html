@@ -3,80 +3,90 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>German Flown Foreign Aerial Photography</title>
+    <title>WWII Aerial Photography</title>
 
-    <!-- Leaflet CSS -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-          crossorigin=""/>
-
-    <!-- Leaflet.markercluster CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
 
     <style>
         body { margin: 0; padding: 0; font-family: sans-serif; }
-        #map { height: 100vh; width: 100%; }
+        #map-container { position: relative; height: 100vh; width: 100%; }
+        #map { height: 100%; width: 100%; }
         .popup-image { max-width: 200px; max-height: 200px; display: block; margin-top: 5px; }
 
-        /* --- Loader Styles --- */
+        /* --- Loader Styles (keep existing) --- */
         #loader-container {
-            position: fixed; /* Or absolute if #map is the container */
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(255, 255, 255, 0.8); /* Semi-transparent overlay */
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            z-index: 10000; /* Ensure it's on top */
-            flex-direction: column; /* To stack spinner and text */
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-color: rgba(255, 255, 255, 0.85); display: flex;
+            justify-content: center; align-items: center; z-index: 10000;
+            flex-direction: column;
         }
-
         .spinner {
-            border: 8px solid #f3f3f3; /* Light grey */
-            border-top: 8px solid #3498db; /* Blue */
-            border-radius: 50%;
-            width: 60px;
-            height: 60px;
+            border: 8px solid #f3f3f3; border-top: 8px solid #3498db;
+            border-radius: 50%; width: 60px; height: 60px;
             animation: spin 1s linear infinite;
-            margin-bottom: 15px; /* Space between spinner and text */
         }
+        #progress-info { width: 80%; max-width: 400px; text-align: center; }
+        #progress-bar-container {
+            width: 100%; background-color: #e0e0e0; border-radius: 4px;
+            overflow: hidden; height: 20px; margin-bottom: 8px;
+        }
+        #progress-bar {
+            width: 0%; height: 100%; background-color: #3498db;
+            transition: width 0.1s linear;
+        }
+        #loader-text { font-size: 1.1em; color: #333; margin-top: 15px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .hidden { display: none !important; }
 
-        #loader-container p {
-            font-size: 1.2em;
-            color: #333;
+        /* --- Date Filter Controls Styles --- */
+        #date-filter-controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 10px 15px;
+            border-radius: 5px;
+            box-shadow: 0 1px 7px rgba(0,0,0,0.4);
+            z-index: 1000;
+            min-width: 280px;
         }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+        #date-filter-controls h4 {
+            margin-top: 0; margin-bottom: 10px; font-size: 1em; text-align: center;
         }
-        /* Hide class for the loader */
-        .hidden {
-            display: none !important;
-        }
+        .date-slider-group { margin-bottom: 10px; }
+        .date-slider-group label { display: block; font-size: 0.9em; margin-bottom: 3px; }
+        .date-slider-group input[type="range"] { width: 100%; cursor: pointer; }
+        .date-slider-group .date-value { font-size: 0.85em; color: #555; text-align: right; min-height: 1em; }
     </style>
 </head>
 <body>
-    <!-- Loader Element -->
     <div id="loader-container">
         <div class="spinner"></div>
-        <p>Loading map data...</p>
+        <div id="progress-info" class="hidden">
+            <div id="progress-bar-container"><div id="progress-bar"></div></div>
+        </div>
+        <p id="loader-text">Initializing...</p>
     </div>
 
-    <div id="map"></div>
+    <div id="map-container">
+        <div id="map"></div>
+        <div id="date-filter-controls" class="hidden">
+            <h4>Filter by Date Range</h4>
+            <div class="date-slider-group">
+                <label for="startDateSlider">Start Date: <span id="startDateValue" class="date-value"></span></label>
+                <input type="range" id="startDateSlider" name="startDateSlider" />
+            </div>
+            <div class="date-slider-group">
+                <label for="endDateSlider">End Date: <span id="endDateValue" class="date-value"></span></label>
+                <input type="range" id="endDateSlider" name="endDateSlider" />
+            </div>
+        </div>
+    </div>
 
-    <!-- Leaflet JavaScript -->
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-            crossorigin=""></script>
-
-    <!-- Leaflet.markercluster JavaScript -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-
-    <!-- Your custom map logic -->
     <script src="map_logic.js" defer></script>
 </body>
 </html>
