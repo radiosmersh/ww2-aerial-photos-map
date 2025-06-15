@@ -1,59 +1,89 @@
-// parse_worker.js (Simplified Version - Updated for existing geometry in array items)
+// parse_worker.js
 self.onmessage = function(e) {
+    // --- TARGETED LOGGING ON RECEIPT ---
+    console.log("[PARSE_WORKER] Received message. Full e.data object:", e.data); // Should be an object: { geoJsonStrings: [...], datePropertyName: "..." }
+    if (e.data && e.data.hasOwnProperty('geoJsonStrings')) { // Check if property exists
+        const receivedStrings = e.data.geoJsonStrings;
+        console.log("[PARSE_WORKER] e.data.geoJsonStrings received. Type:", typeof receivedStrings, "Is Array:", Array.isArray(receivedStrings));
+        if (Array.isArray(receivedStrings)) {
+            console.log("[PARSE_WORKER] Length of received geoJsonStrings:", receivedStrings.length);
+            if (receivedStrings.length > 0 && typeof receivedStrings[0] === 'string') {
+                console.log("[PARSE_WORKER] Snippet of first string in received array:", receivedStrings[0].substring(0, 50) + (receivedStrings[0].length > 50 ? "..." : ""));
+            } else if (receivedStrings.length > 0) {
+                console.log("[PARSE_WORKER] First element in received array is not a string. Type:", typeof receivedStrings[0]);
+            }
+        }
+    } else {
+        // This block should NOT be hit if the minimal worker test was fine
+        console.error("[PARSE_WORKER] e.data is problematic or does not contain geoJsonStrings. e.data:", e.data);
+    }
+    // --- END TARGETED LOGGING ---
 
+    // Original destructuring:
+    // This is where things might go wrong if e.data is not what's expected,
+    // despite the logs above potentially showing it's okay.
     const { geoJsonStrings, datePropertyName } = e.data;
+
+    // Log values AFTER destructuring
+    console.log("[PARSE_WORKER] After destructuring: geoJsonStrings type:", typeof geoJsonStrings, "Is Array:", Array.isArray(geoJsonStrings));
+    if(Array.isArray(geoJsonStrings)) {
+        console.log("[PARSE_WORKER] After destructuring: geoJsonStrings length:", geoJsonStrings.length);
+    }
+
+
+    if (!geoJsonStrings || !Array.isArray(geoJsonStrings) || geoJsonStrings.length === 0) {
+        console.error("[PARSE_WORKER] Condition for error met. Actual geoJsonStrings variable after destructuring:", geoJsonStrings);
+        self.postMessage({ type: 'error', message: 'No GeoJSON strings array received by parser worker.' });
+        return;
+    }
+
+    console.log("[PARSE_WORKER] Proceeding with parsing. Number of strings to parse:", geoJsonStrings.length); // New log
     let allFeatures = [];
 
     for (const geoJsonString of geoJsonStrings) {
-        // Assuming geoJsonString is a non-empty, valid JSON string.
-        let parsedData;
-        try {
-            parsedData = JSON.parse(geoJsonString);
-        } catch (error) {
-            // This block should ideally not be hit if all assumptions about input validity hold.
-            console.error("[PARSE_WORKER] Error parsing a GeoJSON string (was assumed to be perfectly valid JSON):", error, "String snippet (first 100 chars):", geoJsonString.substring(0, 100));
-            continue; // Skip this problematic string
+        if (!geoJsonString || typeof geoJsonString !== 'string' || geoJsonString.trim() === "") {
+            console.warn("[PARSE_WORKER] Skipping empty, null, or non-string item in geoJsonStrings array:", geoJsonString);
+            continue;
         }
+        console.log("[PARSE_WORKER] Attempting to parse string (first 70 chars):", geoJsonString.substring(0,70)); // New log
+        try {
+            const parsedData = JSON.parse(geoJsonString);
 
-        if (parsedData && parsedData.type === "FeatureCollection" && Array.isArray(parsedData.features)) {
-            // Assuming if type is "FeatureCollection", .features is a valid array of features.
-            allFeatures = allFeatures.concat(parsedData.features);
-        } else if (Array.isArray(parsedData)) {
-            // Assuming this is an array of objects, each intended to become a GeoJSON Feature.
-            // Each item should already have its own `geometry` object.
-            const transformedFeatures = parsedData.map(item => {
-                // Basic check: item is an object and has `geometry` with `coordinates`.
-                if (item && typeof item === 'object' && item.geometry && Array.isArray(item.geometry.coordinates)) {
-                    const { geometry, ...otherProperties } = item; // Destructure to separate geometry from the rest
-
-                    const properties = { ...otherProperties }; // Use remaining item keys as properties
-
-                    // Apply date property logic:
-                    // If `properties` (derived from `item`) has a 'date' field,
-                    // ensure `properties[datePropertyName]` gets this value.
-                    if (properties.hasOwnProperty('date')) {
-                        properties[datePropertyName] = properties.date;
+            if (parsedData && parsedData.type === "FeatureCollection" && Array.isArray(parsedData.features)) {
+                allFeatures = allFeatures.concat(parsedData.features);
+            }
+            else if (Array.isArray(parsedData)) {
+                const transformedFeatures = parsedData.map(item => {
+                    if (item.latitude !== undefined && item.longitude !== undefined) {
+                        const properties = { ...item };
+                        if (item.date && datePropertyName !== 'date') {
+                             properties[datePropertyName] = item.date;
+                        } else if (!item[datePropertyName] && item.date) {
+                            properties[datePropertyName] = item.date;
+                        }
+                        return {
+                            type: "Feature",
+                            geometry: {
+                                type: "Point",
+                                coordinates: [parseFloat(item.longitude), parseFloat(item.latitude)]
+                            },
+                            properties: properties
+                        };
+                    } else {
+                        console.warn("[PARSE_WORKER] Skipping item in GeoJSON array due to missing lat/lon:", item);
+                        return null;
                     }
-
-                    return {
-                        type: "Feature",
-                        geometry: geometry, // Use the existing geometry object directly
-                        properties: properties
-                    };
-                } else {
-                    // This implies an item in the array did not conform to the expected structure
-                    // (i.e., having `item.geometry.coordinates`).
-                    console.warn("[PARSE_WORKER] Skipping item in array: item is not an object, or missing 'geometry', or 'geometry.coordinates'. Item:", JSON.stringify(item));
-                    return null; // Mark for filtering
-                }
-            }).filter(Boolean); // Remove any nulls from items that couldn't be transformed
-            allFeatures = allFeatures.concat(transformedFeatures);
-        } else {
-            // This block should ideally not be hit if the input always matches one of the expected formats.
-            console.warn("[PARSE_WORKER] Parsed data was neither a FeatureCollection nor an array of objects (input was assumed to be one of these):", parsedData);
+                }).filter(Boolean);
+                allFeatures = allFeatures.concat(transformedFeatures);
+            } else {
+                console.warn("[PARSE_WORKER] Parsed data is not a valid FeatureCollection or array:", parsedData);
+            }
+        } catch (error) {
+            console.error("[PARSE_WORKER] Error parsing a GeoJSON string in worker:", error, "String was (first 100 chars):", geoJsonString.substring(0,100));
+            // To avoid stopping the whole worker on one bad string, you might consider just continuing the loop.
+            // For now, it will continue.
         }
     }
-
-    // console.log("[PARSE_WORKER] Parsing complete. Total features extracted:", allFeatures.length); // Optional
+    console.log("[PARSE_WORKER] Parsing complete. Total features extracted:", allFeatures.length); // New log
     self.postMessage({ type: 'success', data: { type: "FeatureCollection", features: allFeatures } });
 };
