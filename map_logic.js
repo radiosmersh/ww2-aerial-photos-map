@@ -5,7 +5,7 @@ const GEOJSON_FILE_PATHS = [
 'scans_nara.geojson',
 'scans_ign.geojson',
 'scans_barch.geojson',
-//'scans_wur.geojson' // for later
+'scans_wur.geojson' // for later
 ];
 const PARSE_WORKER_PATH = 'parse_worker.js';
 const FILTER_WORKER_PATH = 'filter_worker.js';
@@ -336,11 +336,15 @@ if (properties.scale) content += `Scale: 1:${properties.scale}<br>`;
 if (properties.naId) content += `NARA ID: <a href="https://catalog.archives.gov/id/${properties.naId}" target="_blank" rel="noopener noreferrer">${properties.naId}</a><br>`;
 
 if (properties.objectUrl) {
-    content += `<a href="${properties.objectUrl}" target="_blank" rel="noopener noreferrer">View Full Image</a><br>`;
+    // Link to the full image / NARA catalog page for the object
+    content += `<a href="${properties.objectUrl}" target="_blank" rel="noopener noreferrer" title="View full image or catalog page in new tab">View Full Image / Catalog Page</a><br>`;
     
     const { imageId, statusId } = getNaraPreviewElementIds(properties); // Uses deterministic IDs
     content += `<div id="${statusId}" class="nara-preview-status">Loading preview...</div>`;
-    content += `<img id="${imageId}" src="#" alt="NARA Preview" class="popup-image nara-iiif-preview" style="display:none; max-width:250px; max-height:250px;">`;
+    // Wrap the <img> tag with an <a> tag linking to the direct objectUrl
+    content += `<a href="${properties.objectUrl}" target="_blank" rel="noopener noreferrer" title="View full image or catalog page in new tab">`;
+    content += `<img id="${imageId}" src="#" alt="NARA Preview" class="popup-image nara-iiif-preview" style="display:none; max-width:250px; max-height:250px; border:0;">`;
+    content += `</a>`;
 }
 return content || "No details available.";
 }
@@ -387,14 +391,17 @@ if (hasGeoTiffInfo) {
     const geoTiffUrl = `https://data.geopf.fr/chunk/telechargement/download/pva/${properties.mission_id}/${properties.image_id}.tif`;
     const { canvasId, statusId } = getGeoTiffElementIds(properties);
 
-    content += `<a href="${geoTiffUrl}" target="_blank" rel="noopener noreferrer">View Full GeoTIFF</a><br>`;
+    content += `<a href="${geoTiffUrl}" target="_blank" rel="noopener noreferrer" title="Download full GeoTIFF file in new tab">View Full GeoTIFF</a><br>`;
     content += `<div id="${statusId}" class="geotiff-preview-status">Loading preview...</div>`;
     content += `<canvas id="${canvasId}" class="popup-geotiff-canvas" style="display:none;"></canvas>`; // Initially hidden
     
 } else if (properties.objectUrl) { // Fallback if no GeoTIFF info but an objectUrl exists
-    content += `<a href="${properties.objectUrl}" target="_blank" rel="noopener noreferrer">View Full Image</a><br>`;
+    content += `<a href="${properties.objectUrl}" target="_blank" rel="noopener noreferrer" title="View full image in new tab">View Full Image</a><br>`;
     if (/\.(jpeg|jpg|gif|png)$/i.test(properties.objectUrl)) {
-         content += `<img src="${properties.objectUrl}" alt="Preview Image" class="popup-image">`;
+         // Wrap the <img> tag with an <a> tag linking to the objectUrl
+         content += `<a href="${properties.objectUrl}" target="_blank" rel="noopener noreferrer" title="View full image in new tab">`;
+         content += `<img src="${properties.objectUrl}" alt="Preview Image" class="popup-image" style="max-width:250px; max-height:250px; border:0;">`;
+         content += `</a>`;
     }
 }
 return content || "No details available.";
@@ -415,8 +422,11 @@ function createWurPopupContent(properties) {
     if (properties.scale) content += `Scale: 1:${properties.scale}<br>`;
 
     if (properties.cachedImageUrl) {
-        content += `<a href="${properties.cachedImageUrl}" target="_blank" rel="noopener noreferrer">View Full Image</a><br>`;
-        content += `<img src="${properties.cachedImageUrl}" alt="WUR Preview" class="popup-image" style="max-width:250px; max-height:250px;">`;
+        content += `<a href="${properties.cachedImageUrl}" target="_blank" rel="noopener noreferrer" title="View full image in new tab">View Full Image</a><br>`;
+        // Wrap the <img> tag with an <a> tag linking to the cachedImageUrl
+        content += `<a href="${properties.cachedImageUrl}" target="_blank" rel="noopener noreferrer" title="View full image in new tab">`;
+        content += `<img src="${properties.cachedImageUrl}" alt="WUR Preview" class="popup-image" style="max-width:250px; max-height:250px; border:0;">`;
+        content += `</a>`;
     }
     return content || "No details available.";
 }
@@ -459,7 +469,8 @@ if (!popupContentElement) {
 }
 
 const { imageId, statusId } = getNaraPreviewElementIds(properties);
-const imageElement = popupContentElement.querySelector(`#${imageId}`);
+// The imageElement is now wrapped in an <a> tag, so we query for the ID within the popup content.
+const imageElement = popupContentElement.querySelector(`#${imageId}`); 
 const statusElement = popupContentElement.querySelector(`#${statusId}`);
 
 if (!imageElement || !statusElement) {
